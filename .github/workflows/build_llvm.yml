@@ -1,0 +1,147 @@
+name: Build LLVM
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'version of the toolchain to build'
+        required: true
+        default: 'v0.1.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          repository: 'YoWASP/clang'
+          submodules: 'true'
+          path: clang
+
+      - uses: actions/checkout@v4
+        with:
+          path: 'rust_wasm'
+          ref: 'gh-actions'
+
+      - name: free space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: install wasm-opt
+        run: |
+          cd /tmp
+          curl -OL https://github.com/WebAssembly/binaryen/releases/download/version_119/binaryen-version_119-x86_64-linux.tar.gz
+          tar -xvf binaryen-version_119-x86_64-linux.tar.gz
+          sudo ln -s /tmp/binaryen-version_119/bin/wasm-opt /usr/local/bin/wasm-opt
+          echo "wasm-opt installed"
+          echo "/tmp/binaryen-version_119/bin/" >> $GITHUB_PATH
+
+      - name: Setup swap space
+        uses: thejerrybao/setup-swap-space@v1
+        with:
+          swap-size-gb: 10
+          remove-existing-swap-files: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: install rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip build
+          sudo apt update
+          sudo apt-get install flex bison ccache
+
+      - name: Build WASM binaries
+        working-directory: "${{ github.workspace }}/clang"
+        run: |
+          sed -i 's/DLLVM_TARGETS_TO_BUILD=WebAssembly/DLLVM_TARGETS_TO_BUILD="X86;AArch64;ARM;LoongArch;PowerPC;RISCV;SystemZ;NVPTX;Sparc;WebAssembly"/' build.sh
+          MAKEFLAGS=-j$(nproc) ./build.sh
+
+      - name: Rename WASI prefix
+        working-directory: "${{ github.workspace }}/clang"
+        run: |
+          ls -l
+          mv wasi-prefix dist
+
+      - name: prepare llvm artifacts
+        working-directory: '${{ github.workspace }}/rust_wasm'
+        run: |
+          mkdir -p llvm-artifacts/dist
+          
+          # Diagnostic: list files in clang directory to understand structure
+          echo "=== Full directory tree of clang/ (first 3 levels) ==="
+          ls -R "${{ github.workspace }}/clang" | grep ":$" | sed -e 's/:$//' -e 's/[^-][^\/]*\//--/g' -e 's/^/   /' | head -n 50 || true
+          
+          # prepare files from clang build
+          cd "${{ github.workspace }}/clang"
+          
+          echo "=== Searching for LLVM binaries ==="
+          # Look for llvm-driver or clang or any wasm files
+          find . -maxdepth 4 -name "llvm-driver" -o -name "clang" -o -name "*.wasm"
+          
+          # Use a flexible search for the compiled binary across the entire checkout
+          WASM_FILE=$(find . -name "llvm-driver" -o -name "clang" | grep bin/ | head -n 1)
+          
+          if [ -z "$WASM_FILE" ]; then
+            echo "Searching for any .wasm files as fallback..."
+            WASM_FILE=$(find . -name "*.wasm" | grep -v "test" | head -n 1)
+          fi
+
+          if [ -n "$WASM_FILE" ]; then
+            echo "Found binary at: $WASM_FILE"
+            file "$WASM_FILE" || true
+            
+            # Use --force-local for safety (though this is Linux)
+            tar --force-local -I "gzip -9" -cvf ${{ github.workspace }}/rust_wasm/llvm-artifacts/dist/llvm_raw.wasm.tar.gz "$WASM_FILE"
+            
+            # optimize wasm
+            cp -r ${{ github.workspace }}/rust_wasm/config_rewriter /tmp/config_rewriter
+            cd /tmp/config_rewriter
+            cargo run --bin wasm_optimizer -- "${{ github.workspace }}/clang/$WASM_FILE"
+            mv opt.wasm ${{ github.workspace }}/rust_wasm/llvm-artifacts/llvm_opt.wasm
+            
+            cd ${{ github.workspace }}/rust_wasm/llvm-artifacts
+            tar --force-local -I "brotli -q 11" -cf llvm_opt.wasm.br llvm_opt.wasm
+            rm llvm_opt.wasm
+          else
+            echo "ERROR: Could not locate LLVM binary (llvm-driver, clang, or any .wasm file)"
+            exit 1
+          fi
+
+          # copy other files
+          cd ${{ github.workspace }}/clang
+          if [ -d "dist" ]; then
+            cp -r dist/* ${{ github.workspace }}/rust_wasm/llvm-artifacts/dist/
+          fi
+          
+          # Archive into a single file
+          cd ${{ github.workspace }}/rust_wasm
+          tar --force-local -cf ${{ github.workspace }}/rust_wasm/llvm-bins.tar -C llvm-artifacts .
+          echo "=== Artifact status ==="
+          ls -lh ${{ github.workspace }}/rust_wasm/llvm-bins.tar
+          rm -rf llvm-artifacts
+
+      - name: upload llvm artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: llvm-bins
+          path: ${{ github.workspace }}/rust_wasm/llvm-bins.tar
+          if-no-files-found: error

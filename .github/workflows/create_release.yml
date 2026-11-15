@@ -1,0 +1,181 @@
+name: create release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'version of the toolchain to build'
+        required: true
+        default: 'v0.2.0'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: rust_wasm
+
+      - name: free space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: install brotli
+        run: |
+          sudo apt-get update
+          sudo apt-get install brotli
+          echo "brotli installed time: $(date)"
+
+      - name: download artifacts
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          mkdir -p artifacts
+          
+          # Get latest successful run for build_llvm.yml
+          RUN_ID_LLVM=$(gh run list --workflow build_llvm.yml --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+          if [ "$RUN_ID_LLVM" != "null" ] && [ -n "$RUN_ID_LLVM" ]; then
+            gh run download "$RUN_ID_LLVM" --name llvm-bins --dir artifacts/llvm-bins || echo "llvm-bins not found"
+          fi
+          
+          # Get latest successful run for rustc_llvm_with_lld.yml and download each artifact
+          # Since jobs are run separately, artifacts are spread across different recent runs.
+          for run_id in $(gh run list --workflow rustc_llvm_with_lld.yml --status success --limit 10 --json databaseId --jq '.[].databaseId'); do
+            if [ ! -d "artifacts/rustc-bins" ]; then
+              gh run download "$run_id" --name rustc-bins --dir artifacts/rustc-bins 2>/dev/null && echo "rustc-bins found in $run_id"
+            fi
+            if [ ! -d "artifacts/dist-linux" ]; then
+              gh run download "$run_id" --name dist-linux --dir artifacts/dist-linux 2>/dev/null && echo "dist-linux found in $run_id"
+            fi
+            if [ ! -d "artifacts/dist-macos" ]; then
+              gh run download "$run_id" --name dist-macos --dir artifacts/dist-macos 2>/dev/null && echo "dist-macos found in $run_id"
+            fi
+            if [ ! -d "artifacts/dist-windows" ]; then
+              gh run download "$run_id" --name dist-windows --dir artifacts/dist-windows 2>/dev/null && echo "dist-windows found in $run_id"
+            fi
+          done
+          
+          # Extract tar artifacts
+          for f in artifacts/*/llvm-bins.tar artifacts/*/rustc-bins.tar artifacts/dist-*/dist-*.tar; do
+            if [ -f "$f" ]; then
+              dir=$(dirname "$f")
+              tar -xf "$f" -C "$dir"
+              rm "$f"
+            fi
+          done
+          
+          ls -R artifacts
+
+      - name: create release assets
+        working-directory: "${{ github.workspace }}/rust_wasm"
+        env:
+          GZIP: -9
+        run: |
+          mkdir -p "${{ github.workspace }}/x-tools"
+          
+          # Process Linux Dist
+          if [ -d "${{ github.workspace }}/artifacts/dist-linux" ]; then
+            cd "${{ github.workspace }}/artifacts/dist-linux/dist/lib/rustlib"
+            
+            # Package rust-src
+            if [ -d "src" ]; then
+              tar -czf "${{ github.workspace }}/x-tools/rust-src.tar.gz" src
+              tar -I "brotli -q 11" -cf "${{ github.workspace }}/x-tools/rust-src.tar.br" src
+              echo "rust-src done"
+            fi
+
+            # Package rustc-src
+            if [ -d "rustc-src" ]; then
+              tar -czf "${{ github.workspace }}/x-tools/rustc-src.tar.gz" rustc-src
+              tar -I "brotli -q 11" -cf "${{ github.workspace }}/x-tools/rustc-src.tar.br" rustc-src
+              echo "rustc-src done"
+            fi
+
+            # Package target-specific libs
+            for target in *; do
+              if [ -d "$target" ] && [ "$target" != "src" ] && [ "$target" != "rustc-src" ]; then
+                cd "${target}/lib"
+                tar -czf "${{ github.workspace }}/x-tools/${target}.tar.gz" *
+                tar -I "brotli -q 11" -cf "${{ github.workspace }}/x-tools/${target}.tar.br" *
+                echo "${target} done"
+                cd ../..
+              fi
+            done
+          fi
+
+          # Process Windows Dist
+          if [ -d "${{ github.workspace }}/artifacts/dist-windows" ]; then
+            cd "${{ github.workspace }}/artifacts/dist-windows/dist/lib/rustlib"
+            for target in *; do
+              if [ -d "$target" ] && [ "$target" != "src" ] && [ "$target" != "rustc-src" ]; then
+                cd "${target}/lib"
+                tar -czf "${{ github.workspace }}/x-tools/${target}.tar.gz" *
+                tar -I "brotli -q 11" -cf "${{ github.workspace }}/x-tools/${target}.tar.br" *
+                echo "${target} done"
+                cd ../..
+              fi
+            done
+          fi
+
+          # Process Mac Dist
+          if [ -d "${{ github.workspace }}/artifacts/dist-macos" ]; then
+            cd "${{ github.workspace }}/artifacts/dist-macos/dist/lib/rustlib"
+            for target in *; do
+              if [ -d "$target" ] && [ "$target" != "src" ] && [ "$target" != "rustc-src" ]; then
+                cd "${target}/lib"
+                tar -czf "${{ github.workspace }}/x-tools/${target}.tar.gz" *
+                tar -I "brotli -q 11" -cf "${{ github.workspace }}/x-tools/${target}.tar.br" *
+                echo "${target} done"
+                cd ../..
+              fi
+            done
+          fi
+
+          # Process Rust Bins
+          if [ -d "${{ github.workspace }}/artifacts/rustc-bins" ]; then
+            cd "${{ github.workspace }}/artifacts/rustc-bins"
+            cp rustc_opt.wasm.tar.gz "${{ github.workspace }}/x-tools/rustc_opt.wasm.tar.gz"
+            mkdir unpack
+            cd unpack
+            tar -xzf ../rustc_opt.wasm.tar.gz
+            brotli -q 11 -o "${{ github.workspace }}/x-tools/rustc_opt.wasm.br" rustc_opt.wasm
+            cd ..
+            rm -rf unpack
+            echo "rustc bins done"
+          fi
+
+          # Process LLVM Bins
+          if [ -d "${{ github.workspace }}/artifacts/llvm-bins" ]; then
+            cd "${{ github.workspace }}/artifacts/llvm-bins"
+            cp dist/llvm_raw.wasm.tar.gz "${{ github.workspace }}/x-tools/llvm_raw.wasm.tar.gz"
+            cp llvm_opt.wasm.br "${{ github.workspace }}/x-tools/llvm_opt.wasm.br"
+            echo "llvm bins done"
+          fi
+
+      - name: upload release
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: |
+            x-tools/*.tar.gz, x-tools/*.br
+          tag: "${{ github.event.inputs.version }}-release"
+          allowUpdates: true
+          prerelease: true
+
+      - name: Finalize
+        run: |
+          ls -l x-tools/
+          echo "Release created successfully"
