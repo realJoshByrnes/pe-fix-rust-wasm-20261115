@@ -69,7 +69,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt upgrade -y
-          sudo apt install -y build-essential cmake pkg-config libclang-dev
+          sudo apt install -y build-essential cmake pkg-config libclang-dev gcc-12 g++-12
 
       - name: install toolchain-for-building-rustc
         working-directory: '${{ github.workspace }}/rust'
@@ -111,6 +111,8 @@ jobs:
         env:
           RUST_CONFIGURE_ARGS: "-W warnings"
           RUSTFLAGS: "-W warnings"
+          CC: gcc-12
+          CXX: g++-12
         run: |
           ./x.py install --config config.llvm.toml
 
